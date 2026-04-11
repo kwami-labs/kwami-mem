@@ -34,6 +34,8 @@ from google import genai
 from google.genai import types
 
 from kwami_mem.embedding.gemini import GeminiEmbeddingProvider
+from kwami_mem.embedding.sparse import SparseEmbeddingProvider
+from kwami_mem.embedding.rerank import CrossEncoderReranker
 from kwami_mem.models import MemoryEntry, MemoryType, Modality, Role
 from kwami_mem.storage.qdrant import QdrantStorage
 from kwami_mem.utils.hashing import content_hash
@@ -106,14 +108,16 @@ async def embed_texts_batched(
 def build_answer_prompt(question: str, context: str, question_date: str) -> str:
     """Build the prompt for generating an answer from retrieved context."""
     return (
-        "You are a helpful assistant with access to a user's conversation history. "
-        "Use the following retrieved conversation memories to answer the user's question. "
-        "If the information is not available in the memories, say that you don't have "
-        "enough information to answer.\n\n"
+        "You are an expert AI assistant evaluating long-term conversational memory. "
+        "Use ONLY the following retrieved memories to answer the user's question.\n\n"
+        "RULES:\n"
+        "1. STRICT ABSTENTION: If the answer is not explicitly stated in the retrieved memories, you MUST output exactly: \"I don't have enough information to answer.\"\n"
+        "2. TEMPORAL REASONING: Use the provided memory dates (in brackets) to determine chronological order and understand what is most recent or happened first. The current date is provided below.\n"
+        "3. PREFERENCES: When determining preferences, distinguish between passing mentions and explicit statements of preference.\n\n"
         f"Current date: {question_date}\n\n"
-        f"## Retrieved Memories\n{context}\n\n"
+        f"## Retrieved Memories (Format: [Date] [Role] (score): Content)\n{context}\n\n"
         f"## Question\n{question}\n\n"
-        "Answer concisely and directly."
+        "Answer concisely and directly. If the information is not present, remember Rule 1."
     )
 
 
@@ -128,6 +132,11 @@ async def run_single_question(
     embedding_dims: int = 768,
     embedding_model: str = "gemini-embedding-2-preview",
     generation_model: str = "gemini-2.5-flash",
+    disable_rate_limit: bool = False,
+    use_hybrid: bool = True,
+    shared_embedder: GeminiEmbeddingProvider | None = None,
+    shared_sparse_embedder: SparseEmbeddingProvider | None = None,
+    shared_reranker: CrossEncoderReranker | None = None,
 ) -> dict:
     """Run benchmark on a single LongMemEval question.
 
@@ -151,14 +160,22 @@ async def run_single_question(
         url=None,  # In-memory
         collection_name=f"bench_{qid}",
         vector_size=embedding_dims,
+        use_hybrid=use_hybrid,
     )
     await storage.initialize()
 
-    embedder = GeminiEmbeddingProvider(
+    embedder = shared_embedder or GeminiEmbeddingProvider(
         api_key=gemini_api_key,
         model=embedding_model,
         dimensions=embedding_dims,
     )
+    
+    sparse_embedder = shared_sparse_embedder
+    reranker = shared_reranker
+    if use_hybrid and not sparse_embedder:
+        sparse_embedder = SparseEmbeddingProvider(model="Qdrant/bm25")
+    if use_hybrid and not reranker:
+        reranker = CrossEncoderReranker(model="cross-encoder/ms-marco-MiniLM-L-6-v2")
 
     # --- 2. Collect all turns ---
     turn_texts: list[str] = []
@@ -197,14 +214,33 @@ async def run_single_question(
     total_turns = len(turn_texts)
 
     # --- 3. Batch embed all turns ---
-    vectors = await embed_texts_batched(embedder, turn_texts)
+    pause_sec = 0.0 if disable_rate_limit else RATE_LIMIT_PAUSE
+    vectors = await embed_texts_batched(embedder, turn_texts, pause_seconds=pause_sec)
+
+    sparse_vectors = None
+    if use_hybrid and turn_texts:
+        sparse_vectors = await sparse_embedder.embed_texts(turn_texts)
 
     # --- 4. Bulk upsert into Qdrant ---
-    await storage.upsert(turn_entries, vectors)
+    await storage.upsert(turn_entries, vectors, sparse_vectors=sparse_vectors)
 
     # --- 5. Embed query and search ---
     query_vector = await embedder.embed_text(question, task_type="RETRIEVAL_QUERY")
-    search_results = await storage.search(query_vector, limit=top_k)
+    sparse_query_vec = None
+
+    search_limit = top_k * 5 if use_hybrid else top_k
+
+    if use_hybrid:
+        sparse_query_vec = await sparse_embedder.embed_text(question)
+
+    search_results = await storage.search(
+        query_vector, 
+        limit=search_limit,
+        sparse_query_vector=sparse_query_vec
+    )
+
+    if use_hybrid and search_results:
+        search_results = reranker.rerank(question, search_results, top_k=top_k)
 
     # --- 6. Compute retrieval metrics ---
     # Map entry IDs to session IDs and has_answer flags
@@ -242,10 +278,17 @@ async def run_single_question(
     )
 
     # --- 7. Generate answer ---
+    sid_to_date = dict(zip(session_ids, session_dates))
     context_parts = []
     for r in search_results:
+        idx = entry_id_to_idx.get(r.entry.id)
+        sdate = "Unknown date"
+        if idx is not None:
+            sid = turn_session_ids[idx]
+            sdate = sid_to_date.get(sid, "Unknown date")
+        
         context_parts.append(
-            f"[{r.entry.role.value}] (score: {r.score:.3f}): {r.entry.content}"
+            f"[{sdate}] [{r.entry.role.value}] (score: {r.score:.3f}): {r.entry.content}"
         )
     context_str = "\n".join(context_parts) if context_parts else "(no relevant memories found)"
 
@@ -298,6 +341,8 @@ async def run_benchmark(
     embedding_dims: int = 768,
     embedding_model: str = "gemini-embedding-2-preview",
     generation_model: str = "gemini-2.5-flash",
+    disable_rate_limit: bool = False,
+    use_hybrid: bool = True,
 ) -> None:
     """Run the full LongMemEval benchmark."""
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
@@ -324,11 +369,28 @@ async def run_benchmark(
     print(f"Total turns to embed: {total_turns:,}")
     print(f"Embedding model: {embedding_model}")
     print(f"Generation model: {generation_model}")
-    print(f"Rate limit: {BATCH_SIZE} embeddings/batch, {RATE_LIMIT_PAUSE:.0f}s pause")
+    if disable_rate_limit:
+        print(f"Rate limit: DISABLED ({BATCH_SIZE} embeddings/batch, no pause)")
+    else:
+        print(f"Rate limit: {BATCH_SIZE} embeddings/batch, {RATE_LIMIT_PAUSE:.0f}s pause")
     print("-" * 60)
 
     # Ensure output directory exists
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Initialize shared models once
+    shared_embedder = GeminiEmbeddingProvider(
+        api_key=gemini_api_key,
+        model=embedding_model,
+        dimensions=embedding_dims,
+    )
+    
+    shared_sparse_embedder = None
+    shared_reranker = None
+    if use_hybrid:
+        print("Initializing Hybrid Models (BM25 + CrossEncoder)...")
+        shared_sparse_embedder = SparseEmbeddingProvider(model="Qdrant/bm25")
+        shared_reranker = CrossEncoderReranker(model="cross-encoder/ms-marco-MiniLM-L-6-v2")
 
     results = []
     total_session_recall = 0.0
@@ -357,6 +419,11 @@ async def run_benchmark(
                     embedding_dims=embedding_dims,
                     embedding_model=embedding_model,
                     generation_model=generation_model,
+                    disable_rate_limit=disable_rate_limit,
+                    use_hybrid=use_hybrid,
+                    shared_embedder=shared_embedder,
+                    shared_sparse_embedder=shared_sparse_embedder,
+                    shared_reranker=shared_reranker,
                 )
                 results.append(result)
 
@@ -458,6 +525,16 @@ def main():
         default="gemini-2.5-flash",
         help="Gemini generation model for answers (default: gemini-2.5-flash)",
     )
+    parser.add_argument(
+        "--disable-rate-limit",
+        action="store_true",
+        help="Disable artificial pauses between batches (for paid tier accounts)",
+    )
+    parser.add_argument(
+        "--no-hybrid",
+        action="store_true",
+        help="Disable Hybrid Search + CrossEncoder reranking",
+    )
 
     args = parser.parse_args()
 
@@ -470,6 +547,8 @@ def main():
             embedding_dims=args.embedding_dims,
             embedding_model=args.embedding_model,
             generation_model=args.generation_model,
+            disable_rate_limit=args.disable_rate_limit,
+            use_hybrid=not args.no_hybrid,
         )
     )
 

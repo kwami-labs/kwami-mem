@@ -39,9 +39,11 @@ class QdrantStorage(StorageBackend):
         api_key: str | None = None,
         collection_name: str = "kwami_memory",
         vector_size: int = 768,
+        use_hybrid: bool = False,
     ) -> None:
         self._collection_name = collection_name
         self._vector_size = vector_size
+        self._use_hybrid = use_hybrid
 
         if url:
             self._client = QdrantClient(url=url, api_key=api_key)
@@ -60,14 +62,34 @@ class QdrantStorage(StorageBackend):
         existing = {c.name for c in collections.collections}
 
         if self._collection_name not in existing:
-            await self._run_sync(
-                self._client.create_collection,
-                collection_name=self._collection_name,
-                vectors_config=VectorParams(
-                    size=self._vector_size,
-                    distance=Distance.COSINE,
-                ),
-            )
+            if self._use_hybrid:
+                from qdrant_client import models
+                vectors_config = {
+                    "dense": models.VectorParams(
+                        size=self._vector_size,
+                        distance=models.Distance.COSINE,
+                    )
+                }
+                sparse_vectors_config = {
+                    "sparse": models.SparseVectorParams(
+                        modifier=models.Modifier.IDF
+                    )
+                }
+                await self._run_sync(
+                    self._client.create_collection,
+                    collection_name=self._collection_name,
+                    vectors_config=vectors_config,
+                    sparse_vectors_config=sparse_vectors_config,
+                )
+            else:
+                await self._run_sync(
+                    self._client.create_collection,
+                    collection_name=self._collection_name,
+                    vectors_config=VectorParams(
+                        size=self._vector_size,
+                        distance=Distance.COSINE,
+                    ),
+                )
 
         # Create payload indexes for efficient filtering
         indexed_fields = {
@@ -95,19 +117,38 @@ class QdrantStorage(StorageBackend):
         self,
         entries: list[MemoryEntry],
         vectors: list[list[float]],
+        sparse_vectors: list[dict] | None = None,
     ) -> None:
         """Store memory entries with their embedding vectors."""
         if not entries:
             return
 
-        points = [
-            PointStruct(
-                id=entry.id,
-                vector=vector,
-                payload=entry.to_payload(),
-            )
-            for entry, vector in zip(entries, vectors)
-        ]
+        if self._use_hybrid:
+            assert sparse_vectors is not None, "Hybrid storage requires sparse_vectors argument."
+            from qdrant_client import models
+            points = [
+                PointStruct(
+                    id=entry.id,
+                    vector={
+                        "dense": dense_vec,
+                        "sparse": models.SparseVector(
+                            indices=sparse_vec["indices"],
+                            values=sparse_vec["values"],
+                        )
+                    },
+                    payload=entry.to_payload(),
+                )
+                for entry, dense_vec, sparse_vec in zip(entries, vectors, sparse_vectors)
+            ]
+        else:
+            points = [
+                PointStruct(
+                    id=entry.id,
+                    vector=vector,
+                    payload=entry.to_payload(),
+                )
+                for entry, vector in zip(entries, vectors)
+            ]
 
         await self._run_sync(
             self._client.upsert,
@@ -122,19 +163,52 @@ class QdrantStorage(StorageBackend):
         limit: int = 10,
         filters: dict[str, Any] | None = None,
         score_threshold: float | None = None,
+        sparse_query_vector: dict | None = None,
     ) -> list[SearchResult]:
         """Search for similar memories with optional metadata filtering."""
         query_filter = self._build_filter(filters) if filters else None
 
-        results = await self._run_sync(
-            self._client.query_points,
-            collection_name=self._collection_name,
-            query=query_vector,
-            limit=limit,
-            query_filter=query_filter,
-            score_threshold=score_threshold,
-            with_payload=True,
-        )
+        if self._use_hybrid and sparse_query_vector:
+            from qdrant_client import models
+            results = await self._run_sync(
+                self._client.query_points,
+                collection_name=self._collection_name,
+                prefetch=[
+                    models.Prefetch(
+                        query=query_vector,
+                        using="dense",
+                        limit=limit,
+                        filter=query_filter,
+                    ),
+                    models.Prefetch(
+                        query=models.SparseVector(
+                            indices=sparse_query_vector["indices"],
+                            values=sparse_query_vector["values"],
+                        ),
+                        using="sparse",
+                        limit=limit,
+                        filter=query_filter,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=limit,
+                with_payload=True,
+            )
+        else:
+            # Fallback for standard dense-only search
+            query_args = {"query": query_vector}
+            if self._use_hybrid:
+                query_args["using"] = "dense"
+
+            results = await self._run_sync(
+                self._client.query_points,
+                collection_name=self._collection_name,
+                limit=limit,
+                query_filter=query_filter,
+                score_threshold=score_threshold,
+                with_payload=True,
+                **query_args,
+            )
 
         return [
             SearchResult(

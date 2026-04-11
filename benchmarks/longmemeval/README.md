@@ -45,6 +45,11 @@ uv run python benchmarks/longmemeval/run_benchmark.py \
 | `--embedding-dims` | `768` | Embedding dimensionality |
 | `--embedding-model` | `gemini-embedding-2-preview` | Embedding model |
 | `--generation-model` | `gemini-2.0-flash` | Answer generation model |
+| `--disable-rate-limit` | `False` | Disable artificial 62s pauses between embedding batches (for paid-tier accounts) |
+
+### Rate Limits
+
+By default, the benchmark script adds a 62-second pause after every 90 embeddings to comply with the Google Gemini free tier rate limit of 100 requests per minute. If you are using a paid Google AI Studio API key, you should use the `--disable-rate-limit` flag to bypass these pauses and run the benchmark at full speed.
 
 ## Evaluation
 
