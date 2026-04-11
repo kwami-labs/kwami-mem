@@ -14,7 +14,6 @@ from qdrant_client.models import (
     MatchValue,
     PayloadSchemaType,
     PointStruct,
-    ScrollOrder,
     VectorParams,
 )
 

@@ -86,9 +86,20 @@ class QueryProcessor:
         """Detect if the query is specifically about user or assistant messages."""
         lower = query.lower()
 
-        if any(phrase in lower for phrase in ["i said", "i told", "i asked", "i mentioned", "my message"]):
+        user_phrases = [
+            "i said", "i told", "i asked", "i mentioned", "my message",
+            "i say", "i tell", "i ask", "i mention",
+            "did i say", "did i tell", "did i ask",
+        ]
+        if any(phrase in lower for phrase in user_phrases):
             return "user"
-        if any(phrase in lower for phrase in ["you said", "you told", "you answered", "your response", "you mentioned"]):
+
+        assistant_phrases = [
+            "you said", "you told", "you answered", "your response", "you mentioned",
+            "you say", "you tell", "you answer", "you mention",
+            "did you say", "did you tell",
+        ]
+        if any(phrase in lower for phrase in assistant_phrases):
             return "assistant"
 
         return None
