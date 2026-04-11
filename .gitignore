@@ -32,3 +32,8 @@ htmlcov/
 
 # uv
 uv.lock
+
+# Benchmark data & results
+benchmarks/longmemeval/data/*.json
+benchmarks/longmemeval/results/*.jsonl
+benchmarks/longmemeval/results/*.json
