@@ -33,9 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from google import genai
 from google.genai import types
 
+from kwami_mem.embedding.local import LocalEmbeddingProvider
 from kwami_mem.embedding.gemini import GeminiEmbeddingProvider
 from kwami_mem.embedding.sparse import SparseEmbeddingProvider
 from kwami_mem.embedding.rerank import CrossEncoderReranker
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 from kwami_mem.models import MemoryEntry, MemoryType, Modality, Role
 from kwami_mem.storage.qdrant import QdrantStorage
 from kwami_mem.utils.hashing import content_hash
@@ -134,19 +136,13 @@ async def run_single_question(
     generation_model: str = "gemini-2.5-flash",
     disable_rate_limit: bool = False,
     use_hybrid: bool = True,
-    shared_embedder: GeminiEmbeddingProvider | None = None,
+    shared_embedder: EmbeddingProvider | None = None,
     shared_sparse_embedder: SparseEmbeddingProvider | None = None,
     shared_reranker: CrossEncoderReranker | None = None,
+    qdrant_url: str | None = None,
+    openai_base_url: str | None = None,
 ) -> dict:
-    """Run benchmark on a single LongMemEval question.
-
-    Uses batch embedding to minimize API calls:
-    1. Collects all turn texts
-    2. Batch-embeds them (with rate limiting)
-    3. Bulk-upserts into Qdrant
-    4. Searches for relevant memories
-    5. Generates answer with Gemini
-    """
+    """Run benchmark on a single LongMemEval question."""
     qid = question_data["question_id"]
     question = question_data["question"]
     question_date = question_data["question_date"]
@@ -155,10 +151,11 @@ async def run_single_question(
     session_dates = question_data["haystack_dates"]
     answer_session_ids = set(question_data["answer_session_ids"])
 
-    # --- 1. Create storage + embedder directly (bypass KwamiMemory overhead) ---
+    # --- 1. Create storage + embedder ---
+    col_name = f"longmemeval_{embedding_dims}_hybrid" if use_hybrid else f"longmemeval_{embedding_dims}_dense"
     storage = QdrantStorage(
-        url=None,  # In-memory
-        collection_name=f"bench_{qid}",
+        url=qdrant_url,
+        collection_name=col_name,
         vector_size=embedding_dims,
         use_hybrid=use_hybrid,
     )
@@ -198,7 +195,7 @@ async def run_single_question(
                 content=content,
                 role=Role(role_str),
                 conversation_id=conv_id,
-                user_id="benchmark",
+                user_id=qid,
                 memory_type=MemoryType.EPISODIC,
                 modality=Modality.TEXT,
                 turn_index=global_turn_idx,
@@ -213,110 +210,91 @@ async def run_single_question(
 
     total_turns = len(turn_texts)
 
-    # --- 3. Batch embed all turns ---
-    pause_sec = 0.0 if disable_rate_limit else RATE_LIMIT_PAUSE
-    vectors = await embed_texts_batched(embedder, turn_texts, pause_seconds=pause_sec)
+    # --- 3. Check if already cached ---
+    skip_embedding = False
+    if qdrant_url:
+        existing_recs = await storage._run_sync(
+            storage._client.count,
+            collection_name=col_name,
+            count_filter=Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=qid))])
+        )
+        if existing_recs.count >= total_turns:
+            skip_embedding = True
 
-    sparse_vectors = None
-    if use_hybrid and turn_texts:
-        sparse_vectors = await sparse_embedder.embed_texts(turn_texts)
+    if not skip_embedding:
+        pause_sec = 0.0 if disable_rate_limit else RATE_LIMIT_PAUSE
+        vectors = await embed_texts_batched(embedder, turn_texts, pause_seconds=pause_sec)
+        sparse_vectors = None
+        if use_hybrid and turn_texts:
+            sparse_vectors = await sparse_embedder.embed_texts(turn_texts)
+        await storage.upsert(turn_entries, vectors, sparse_vectors=sparse_vectors)
 
-    # --- 4. Bulk upsert into Qdrant ---
-    await storage.upsert(turn_entries, vectors, sparse_vectors=sparse_vectors)
-
-    # --- 5. Embed query and search ---
+    # --- 4. Search ---
     query_vector = await embedder.embed_text(question, task_type="RETRIEVAL_QUERY")
     sparse_query_vec = None
-
-    search_limit = top_k * 5 if use_hybrid else top_k
-
     if use_hybrid:
         sparse_query_vec = await sparse_embedder.embed_text(question)
+        search_limit = top_k * 5
+    else:
+        search_limit = top_k
 
     search_results = await storage.search(
-        query_vector, 
+        query_vector,
+        sparse_query_vector=sparse_query_vec,
         limit=search_limit,
-        sparse_query_vector=sparse_query_vec
+        filters={"user_id": qid},
     )
 
     if use_hybrid and search_results:
         search_results = reranker.rerank(question, search_results, top_k=top_k)
 
-    # --- 6. Compute retrieval metrics ---
-    # Map entry IDs to session IDs and has_answer flags
-    entry_id_to_idx = {e.id: i for i, e in enumerate(turn_entries)}
-
+    # --- 5. Metrics ---
     retrieved_session_ids_set = set()
     retrieved_has_answer_count = 0
     total_evidence_turns = sum(1 for h in turn_has_answer if h)
-
     mrr = 0.0
     for rank, r in enumerate(search_results, 1):
-        idx = entry_id_to_idx.get(r.entry.id)
-        if idx is not None:
-            sid = turn_session_ids[idx]
-            retrieved_session_ids_set.add(sid)
-            if turn_has_answer[idx]:
-                retrieved_has_answer_count += 1
-                if mrr == 0.0 and (sid in answer_session_ids):
-                    mrr = 1.0 / rank
-        # Also check by session membership for MRR
-        if mrr == 0.0 and idx is not None:
-            sid = turn_session_ids[idx]
-            if sid in answer_session_ids:
+        idx = r.entry.turn_index
+        sid = turn_session_ids[idx]
+        retrieved_session_ids_set.add(sid)
+        if turn_has_answer[idx]:
+            retrieved_has_answer_count += 1
+            if mrr == 0.0 and (sid in answer_session_ids):
                 mrr = 1.0 / rank
+        if mrr == 0.0 and turn_session_ids[idx] in answer_session_ids:
+            mrr = 1.0 / rank
 
-    session_recall = (
-        len(answer_session_ids & retrieved_session_ids_set) / len(answer_session_ids)
-        if answer_session_ids
-        else 0.0
-    )
-    turn_recall = (
-        retrieved_has_answer_count / total_evidence_turns
-        if total_evidence_turns > 0
-        else 0.0
-    )
+    session_recall = (len(answer_session_ids & retrieved_session_ids_set) / len(answer_session_ids)) if answer_session_ids else 0.0
+    turn_recall = (retrieved_has_answer_count / total_evidence_turns) if total_evidence_turns > 0 else 0.0
 
-    # --- 7. Generate answer ---
+    # --- 6. Generate ---
     sid_to_date = dict(zip(session_ids, session_dates))
-    context_parts = []
-    for r in search_results:
-        idx = entry_id_to_idx.get(r.entry.id)
-        sdate = "Unknown date"
-        if idx is not None:
-            sid = turn_session_ids[idx]
-            sdate = sid_to_date.get(sid, "Unknown date")
-        
-        context_parts.append(
-            f"[{sdate}] [{r.entry.role.value}] (score: {r.score:.3f}): {r.entry.content}"
-        )
+    context_parts = [f"[{sid_to_date.get(turn_session_ids[r.entry.turn_index], 'Unknown')}] [{r.entry.role.value}] (score: {r.score:.3f}): {r.entry.content}" for r in search_results]
     context_str = "\n".join(context_parts) if context_parts else "(no relevant memories found)"
-
     prompt = build_answer_prompt(question, context_str, question_date)
 
-    # Generate with Gemini (retry on rate limit)
-    client = genai.Client(api_key=gemini_api_key)
     hypothesis = ""
-    for attempt in range(3):
-        try:
-            response = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model=generation_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.0,
-                        max_output_tokens=512,
-                    ),
-                ),
-            )
-            hypothesis = response.text.strip() if response.text else ""
-            break
-        except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                await asyncio.sleep(15 * (attempt + 1))
-            else:
-                hypothesis = f"[Generation error: {e}]"
+    if openai_base_url:
+        import openai
+        o_client = openai.Client(api_key="local", base_url=openai_base_url)
+        for attempt in range(3):
+            try:
+                response = o_client.chat.completions.create(model=generation_model, messages=[{"role": "user", "content": prompt}], max_tokens=64, temperature=0.0)
+                hypothesis = response.choices[0].message.content.strip()
+                break
+            except Exception as e:
+                if attempt == 2: hypothesis = f"ERROR: {e}"
+                await asyncio.sleep(2)
+    else:
+        client = genai.Client(api_key=gemini_api_key)
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(model=generation_model, contents=prompt, config={"temperature": 0.0, "max_output_tokens": 64})
+                hypothesis = response.text.strip() if response.text else "(no output)"
+                break
+            except Exception as e:
+                if attempt == 2: hypothesis = f"ERROR: {e}"
+                await asyncio.sleep(5)
 
     return {
         "question_id": qid,
@@ -337,12 +315,15 @@ async def run_benchmark(
     dataset_path: str,
     output_path: str,
     top_k: int = 10,
-    max_questions: int | None = None,
     embedding_dims: int = 768,
     embedding_model: str = "gemini-embedding-2-preview",
     generation_model: str = "gemini-2.5-flash",
     disable_rate_limit: bool = False,
-    use_hybrid: bool = True,
+    no_hybrid: bool = False,
+    use_local_embeddings: bool = False,
+    qdrant_url: str | None = None,
+    openai_base_url: str | None = None,
+    max_questions: int | None = None,
 ) -> None:
     """Run the full LongMemEval benchmark."""
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
@@ -350,207 +331,55 @@ async def run_benchmark(
         print("ERROR: GEMINI_API_KEY environment variable is required.")
         sys.exit(1)
 
-    # Load dataset
-    print(f"Loading dataset from {dataset_path}...")
     with open(dataset_path) as f:
         dataset = json.load(f)
+    if max_questions: dataset = dataset[:max_questions]
 
-    if max_questions and max_questions < len(dataset):
-        dataset = dataset[:max_questions]
-
-    # Count total turns
-    total_turns = sum(
-        len(turn)
-        for q in dataset
-        for turn in q["haystack_sessions"]
-    )
-
-    print(f"Running benchmark on {len(dataset)} questions (top_k={top_k}, dims={embedding_dims})")
-    print(f"Total turns to embed: {total_turns:,}")
-    print(f"Embedding model: {embedding_model}")
-    print(f"Generation model: {generation_model}")
-    if disable_rate_limit:
-        print(f"Rate limit: DISABLED ({BATCH_SIZE} embeddings/batch, no pause)")
+    if use_local_embeddings:
+        shared_embedder = LocalEmbeddingProvider(model="BAAI/bge-small-en-v1.5", dimensions=384)
+        embedding_dims = 384  # Force correct dimensions for BGE
     else:
-        print(f"Rate limit: {BATCH_SIZE} embeddings/batch, {RATE_LIMIT_PAUSE:.0f}s pause")
-    print("-" * 60)
-
-    # Ensure output directory exists
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-    # Initialize shared models once
-    shared_embedder = GeminiEmbeddingProvider(
-        api_key=gemini_api_key,
-        model=embedding_model,
-        dimensions=embedding_dims,
-    )
-    
-    shared_sparse_embedder = None
-    shared_reranker = None
-    if use_hybrid:
-        print("Initializing Hybrid Models (BM25 + CrossEncoder)...")
-        shared_sparse_embedder = SparseEmbeddingProvider(model="Qdrant/bm25")
-        shared_reranker = CrossEncoderReranker(model="cross-encoder/ms-marco-MiniLM-L-6-v2")
+        shared_embedder = GeminiEmbeddingProvider(api_key=gemini_api_key, model=embedding_model, dimensions=embedding_dims)
+        
+    shared_sparse_embedder = SparseEmbeddingProvider(model="Qdrant/bm25") if not no_hybrid else None
+    shared_reranker = CrossEncoderReranker(model="cross-encoder/ms-marco-MiniLM-L-6-v2") if not no_hybrid else None
 
     results = []
-    total_session_recall = 0.0
-    total_turn_recall = 0.0
-    total_mrr = 0.0
-    start_time = time.time()
-
     with open(output_path, "w") as out_f:
         for i, question_data in enumerate(dataset):
-            qid = question_data["question_id"]
-            qtype = question_data["question_type"]
-            n_sessions = len(question_data["haystack_sessions"])
-            n_turns = sum(len(s) for s in question_data["haystack_sessions"])
-
-            print(
-                f"\n[{i+1}/{len(dataset)}] {qid} ({qtype}, "
-                f"{n_sessions} sessions, {n_turns} turns)",
-                flush=True,
+            result = await run_single_question(
+                question_data, gemini_api_key, top_k, embedding_dims, embedding_model, generation_model, 
+                disable_rate_limit, not no_hybrid, shared_embedder, shared_sparse_embedder, shared_reranker, 
+                qdrant_url, openai_base_url
             )
+            results.append(result)
+            out_f.write(json.dumps(result) + "\n")
+            out_f.flush()
 
-            try:
-                result = await run_single_question(
-                    question_data,
-                    gemini_api_key=gemini_api_key,
-                    top_k=top_k,
-                    embedding_dims=embedding_dims,
-                    embedding_model=embedding_model,
-                    generation_model=generation_model,
-                    disable_rate_limit=disable_rate_limit,
-                    use_hybrid=use_hybrid,
-                    shared_embedder=shared_embedder,
-                    shared_sparse_embedder=shared_sparse_embedder,
-                    shared_reranker=shared_reranker,
-                )
-                results.append(result)
-
-                metrics = result["retrieval_metrics"]
-                total_session_recall += metrics["session_recall"]
-                total_turn_recall += metrics["turn_recall"]
-                total_mrr += metrics["mrr"]
-
-                print(
-                    f"  → SR={metrics['session_recall']:.2f} "
-                    f"TR={metrics['turn_recall']:.2f} "
-                    f"MRR={metrics['mrr']:.2f} "
-                    f"| Answer: {result['hypothesis'][:80]}..."
-                )
-
-                # Write to output file (JSONL)
-                out_f.write(json.dumps(result) + "\n")
-                out_f.flush()
-
-            except Exception as e:
-                print(f"  → ERROR: {e}")
-                placeholder = {
-                    "question_id": qid,
-                    "hypothesis": f"Error: {e}",
-                    "retrieval_metrics": {
-                        "session_recall": 0.0,
-                        "turn_recall": 0.0,
-                        "mrr": 0.0,
-                        "retrieved_session_ids": [],
-                        "total_turns": 0,
-                        "total_evidence_turns": 0,
-                        "top_k": top_k,
-                    },
-                }
-                out_f.write(json.dumps(placeholder) + "\n")
-                out_f.flush()
-                results.append(placeholder)
-
-    elapsed = time.time() - start_time
-    n = len(results)
-    print("\n" + "=" * 60)
-    print(f"BENCHMARK COMPLETE — {n} questions in {elapsed:.1f}s ({elapsed/n:.1f}s/question)")
-    print(f"  Avg Session Recall@{top_k}: {total_session_recall/n:.4f}")
-    print(f"  Avg Turn Recall@{top_k}:    {total_turn_recall/n:.4f}")
-    print(f"  Avg MRR:                     {total_mrr/n:.4f}")
-    print(f"\nResults saved to: {output_path}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main():
     from dotenv import load_dotenv
     load_dotenv()
-
-    parser = argparse.ArgumentParser(
-        description="Run LongMemEval benchmark on kwami-mem"
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="benchmarks/longmemeval/data/longmemeval_s_cleaned.json",
-        help="Path to LongMemEval dataset JSON",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="benchmarks/longmemeval/results/kwami_mem_results.jsonl",
-        help="Output path for results JSONL",
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=10,
-        help="Number of retrieved memories per question (default: 10)",
-    )
-    parser.add_argument(
-        "--max-questions",
-        type=int,
-        default=None,
-        help="Maximum number of questions to run (default: all)",
-    )
-    parser.add_argument(
-        "--embedding-dims",
-        type=int,
-        default=768,
-        help="Embedding dimensionality (default: 768)",
-    )
-    parser.add_argument(
-        "--embedding-model",
-        type=str,
-        default="gemini-embedding-2-preview",
-        help="Gemini embedding model (default: gemini-embedding-2-preview)",
-    )
-    parser.add_argument(
-        "--generation-model",
-        type=str,
-        default="gemini-2.5-flash",
-        help="Gemini generation model for answers (default: gemini-2.5-flash)",
-    )
-    parser.add_argument(
-        "--disable-rate-limit",
-        action="store_true",
-        help="Disable artificial pauses between batches (for paid tier accounts)",
-    )
-    parser.add_argument(
-        "--no-hybrid",
-        action="store_true",
-        help="Disable Hybrid Search + CrossEncoder reranking",
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="benchmarks/longmemeval/data/longmemeval_s_cleaned.json")
+    parser.add_argument("--output", default="benchmarks/longmemeval/results/kwami_mem_results.jsonl")
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--max-questions", type=int)
+    parser.add_argument("--dims", type=int, default=768)
+    parser.add_argument("--embedding-model", default="gemini-embedding-2-preview")
+    parser.add_argument("--generation-model", default="gemini-2.5-flash")
+    parser.add_argument("--disable-rate-limit", action="store_true")
+    parser.add_argument("--no-hybrid", action="store_true")
+    parser.add_argument("--use-local-embeddings", action="store_true", help="Use local BAAI/bge-small instead of Gemini")
+    parser.add_argument("--qdrant-url", type=str)
+    parser.add_argument("--openai-base-url", type=str)
     args = parser.parse_args()
 
-    asyncio.run(
-        run_benchmark(
-            dataset_path=args.dataset,
-            output_path=args.output,
-            top_k=args.top_k,
-            max_questions=args.max_questions,
-            embedding_dims=args.embedding_dims,
-            embedding_model=args.embedding_model,
-            generation_model=args.generation_model,
-            disable_rate_limit=args.disable_rate_limit,
-            use_hybrid=not args.no_hybrid,
-        )
-    )
+    asyncio.run(run_benchmark(
+        args.dataset, args.output, args.top_k, 384 if args.use_local_embeddings else args.dims, args.embedding_model, 
+        args.generation_model, args.disable_rate_limit, args.no_hybrid, args.use_local_embeddings,
+        args.qdrant_url, args.openai_base_url, args.max_questions
+    ))
 
 
 if __name__ == "__main__":
