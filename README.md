@@ -103,6 +103,8 @@ mem = KwamiMemory(
 
 See [`.env.example`](.env.example) for all available options.
 
+There is no `.env` in git yet. When one is added it is encrypted with git-crypt: the blob is ciphertext and the working tree is plaintext after unlock. On a new machine, install git-crypt and run `git-crypt unlock ~/.config/git-crypt/kwami.io/kwami-mem.key` once. `.env.example` stays plaintext. Plaintext `.env.*` overrides stay gitignored. The key file is not committed.
+
 ## Architecture
 
 ```

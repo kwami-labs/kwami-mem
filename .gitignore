@@ -18,8 +18,10 @@ env/
 *.swp
 *.swo
 
-# Environment
-.env
+# Environment. `.env` is tracked and encrypted with git-crypt.
+# `.env.example` stays plaintext.
+.env.*
+!.env.example
 
 # OS
 .DS_Store
